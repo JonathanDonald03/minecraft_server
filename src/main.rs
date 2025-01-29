@@ -1,11 +1,17 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use rand::Rng;
 use std::{
     io::{Error, ErrorKind, Read, Write},
-    net::{TcpListener, TcpStream},
+    net::TcpListener,
+    sync::Arc,
 };
+use tokio::net::TcpStream;
+use tokio::sync::Mutex;
+use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let listener = TcpListener::bind("0.0.0.0:25565").unwrap();
     for stream in listener.incoming() {
         handle_connection(&mut stream.unwrap());
@@ -19,6 +25,27 @@ pub enum State {
     Transfer = 3,
     Play = 4,
     Config = 5,
+}
+
+struct KeepAliveState {
+    current_keep_alive_id: Mutex<u64>,
+}
+
+impl KeepAliveState {
+    pub fn new() -> Self {
+        Self {
+            current_keep_alive_id: Mutex::new(0),
+        }
+    }
+
+    pub async fn get_current(&self) -> u64 {
+        *self.current_keep_alive_id.lock().await
+    }
+
+    pub async fn set(&self, value: u64) {
+        let mut id = self.current_keep_alive_id.lock().await;
+        *id = value;
+    }
 }
 
 pub struct CurrentState {
@@ -42,31 +69,92 @@ impl CurrentState {
 }
 
 fn handle_connection(stream: &mut TcpStream) {
-    let mut current_state = CurrentState::new(State::HandShake);
-    let hand_shake_packet = handle_handshake(stream);
-    current_state.set_state(hand_shake_packet.unwrap().next_state);
-    let mut login_buf = handle_packet(stream).unwrap();
-    let player_name_uuid = handle_login_client(&mut login_buf).unwrap();
-    let _ = send_login_success(stream, player_name_uuid.0, player_name_uuid.1);
-    let _login_success_ack = handle_packet(stream).unwrap();
-    current_state.set_state(State::Config);
-    //Todo handle error
-    //TODO read client info from stream
-    send_finish_config(stream).unwrap();
-
-    let _finish_config_ack = handle_packet(stream).unwrap();
-    //println!("Finish Config Ack {}", hex::encode(finish_config_ack));
-    current_state.set_state(State::Play);
+    let _current_state = CurrentState::new(State::HandShake);
+    handshake_state(stream);
+    login_state(stream);
+    config_state(stream);
+    let keep_alive_id = KeepAliveState::new();
+    play_state(stream, keep_alive_id);
 }
 
-fn send_finish_config(stream: &mut TcpStream) -> Result<(), Error> {
+fn play_state(
+    stream: Arc<Mutex<TcpStream>>,
+    keep_alive_id: KeepAliveState,
+) -> Result<State, Error> {
+    send_keep_alive(stream, keep_alive_id);
+    loop {
+        let res = handle_packet(stream)?;
+        let prot = res.0;
+        let mut buf = res.1;
+        match prot {
+            0x1A => {
+                println!("Client send keep alive");
+                // Handle keep-alive packet
+                if let Err(e) = handle_keep_alive(&mut buf) {
+                    // Handle the error (e.g., log it or return it)
+                    return Err(e);
+                }
+            }
+            _ => {
+                println!("Protocol not recognized");
+                // Optionally, handle unrecognized protocols
+            }
+        }
+    }
+}
+
+//________________Handle Play Packages_________________
+
+//TODO finish this make sure it actually matches
+fn handle_keep_alive(buf: &mut Bytes) -> Result<(), Error> {
+    let _client_keep_alive_id = buf.get_u64();
+    Ok(())
+}
+
+//_____________________________________________________
+
+async fn send_keep_alive(stream: &mut TcpStream, keep_alive_id: KeepAliveState) {
+    let mut rng = rand::thread_rng();
+    println!("I started keep alive");
+    loop {
+        sleep(Duration::from_secs(15)).await;
+        let mut buf = BytesMut::new();
+
+        let keep_alive_id_ran: u64 = rng.gen();
+        keep_alive_id.set(keep_alive_id_ran).await;
+        buf.put_u64(keep_alive_id_ran);
+        let _res = send_packet(stream, 0x27, buf.freeze());
+        println!("I sent keep alive");
+        //Todo handle error
+    }
+}
+
+fn handshake_state(stream: &mut TcpStream) -> Result<State, Error> {
+    let err = handle_packet(stream)?;
+    let _prot = err.0;
+    let mut buf = err.1;
+
+    let hand_shake_packet = handle_handshake(&mut buf)?;
+
+    Ok(hand_shake_packet.next_state)
+}
+
+//fn status_state(stream: &mut TcpStream) -> Result<State, Error> {}
+
+fn login_state(stream: &mut TcpStream) -> Result<State, Error> {
+    let mut buf = handle_packet(stream)?.1;
+    let player_name_uuid = handle_login_client(&mut buf)?;
+    let _ = send_login_success(stream, player_name_uuid.0, player_name_uuid.1);
+    Ok(State::Config)
+}
+
+//fn transfer_state(stream: &mut TcpStream) -> Result<State, Error> {}
+
+fn config_state(stream: &mut TcpStream) -> Result<State, Error> {
     let buf = Bytes::new();
     send_packet(stream, 3, buf)?;
-    Ok(())
-}
-
-fn send_keep_alive(stream: &mut TcpStream) -> Result<(), Error> {
-    Ok(())
+    let _finish_config_ack = handle_packet(stream).unwrap();
+    Ok(State::Play)
 }
 
 fn send_login_success(stream: &mut TcpStream, name: String, uuid: Uuid) -> Result<(), Error> {
@@ -110,16 +198,9 @@ fn send_packet(stream: &mut TcpStream, protocol: u32, buf: Bytes) -> Result<(), 
     Ok(())
 }
 
-fn handle_packet(stream: &mut TcpStream) -> Result<Bytes, Error> {
+fn handle_packet(stream: &mut TcpStream) -> Result<(u32, Bytes), Error> {
     let packet_length = read_packet_length(stream)?;
-    //  let packet_length = 15;
 
-    //   let mut buf = BytesMut::with_capacity(packet_length as usize);
-    //   stream.read_exact(&mut buf)?;
-    //    println!("Buffer in hex: {}", hex::encode(&buf));
-    //    Ok(buf.freeze())
-
-    // Create a BytesMut buffer with the specified capacity
     let mut bufmut = BytesMut::with_capacity(packet_length as usize);
 
     // Resize the buffer so it can hold the required amount of data
@@ -128,8 +209,8 @@ fn handle_packet(stream: &mut TcpStream) -> Result<Bytes, Error> {
     // Read data from the stream into the BytesMut buffer
     stream.read_exact(&mut bufmut)?;
     let mut buf = bufmut.freeze();
-    let _packet_id = read_var_int(&mut buf);
-    Ok(buf)
+    let packet_id = read_var_int(&mut buf)?;
+    Ok((packet_id, buf))
 }
 
 fn handle_login_client(buf: &mut Bytes) -> Result<(String, Uuid), Error> {
@@ -212,16 +293,14 @@ fn read_unsigned_short(buf: &mut Bytes) -> Result<u16, Error> {
     Ok(u16::from_be_bytes(bytes[..].try_into().unwrap()))
 }
 
-fn handle_handshake(stream: &mut TcpStream) -> Result<HandshakePacket, Error> {
-    let mut buf = handle_packet(stream)?;
-
-    let protocol_version = read_var_int(&mut buf)?;
+fn handle_handshake(buf: &mut Bytes) -> Result<HandshakePacket, Error> {
+    let protocol_version = read_var_int(buf)?;
     println!("Protocol Version {}", protocol_version);
-    let server_address = read_string(&mut buf)?;
+    let server_address = read_string(buf)?;
     println!("Server Address {}", server_address);
-    let server_port = read_unsigned_short(&mut buf)?;
+    let server_port = read_unsigned_short(buf)?;
     println!("Server Port {}", server_port);
-    let next_state_value = read_var_int(&mut buf)?;
+    let next_state_value = read_var_int(buf)?;
     println!("Next State Value {}", next_state_value);
 
     let next_state = match next_state_value {
