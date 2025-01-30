@@ -4,9 +4,12 @@ use std::{
     io::{Error, ErrorKind},
     sync::Arc,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
 use tokio::{
-    net::{TcpListener, TcpStream},
+    io::{AsyncReadExt, AsyncWriteExt, Interest},
+    net::tcp::{OwnedReadHalf, OwnedWriteHalf},
+};
+use tokio::{
+    net::TcpListener,
     sync::Mutex,
     time::{sleep, Duration},
 };
@@ -19,10 +22,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         let (stream, _) = listener.accept().await?;
-        let stream = Arc::new(Mutex::new(stream));
+        let (read_stream, write_stream) = stream.into_split();
+        let read_write_stream = ReadWriteStream {
+            read_stream: Arc::new(Mutex::new(read_stream)),
+            write_stream: Arc::new(Mutex::new(write_stream)),
+        };
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream).await {
+            if let Err(e) = handle_connection(read_write_stream).await {
                 eprintln!("Connection error: {}", e);
             }
         });
@@ -37,6 +44,20 @@ pub enum State {
     Transfer = 3,
     Play = 4,
     Config = 5,
+}
+
+struct ReadWriteStream {
+    read_stream: Arc<Mutex<OwnedReadHalf>>,
+    write_stream: Arc<Mutex<OwnedWriteHalf>>,
+}
+
+impl ReadWriteStream {
+    fn clone(&self) -> Self {
+        Self {
+            read_stream: Arc::clone(&self.read_stream),
+            write_stream: Arc::clone(&self.write_stream),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -101,29 +122,29 @@ impl CurrentState {
     }
 }
 
-async fn handle_connection(stream: Arc<Mutex<TcpStream>>) -> Result<(), Error> {
+async fn handle_connection(stream: ReadWriteStream) -> Result<(), Error> {
     let _current_state = CurrentState::new(State::HandShake);
 
-    handshake_state(Arc::clone(&stream)).await?;
-    login_state(Arc::clone(&stream)).await?;
-    config_state(Arc::clone(&stream)).await?;
+    handshake_state(stream.clone()).await?;
+    login_state(stream.clone()).await?;
+    config_state(stream.clone()).await?;
 
     let keep_alive_id = Arc::new(KeepAliveState::new());
-    play_state(stream, keep_alive_id).await?;
+    play_state(stream.clone(), keep_alive_id).await?;
 
     Ok(())
 }
 
 async fn play_state(
-    stream: Arc<Mutex<TcpStream>>,
+    stream: ReadWriteStream,
     keep_alive_id: Arc<KeepAliveState>,
 ) -> Result<(), Error> {
     // Spawn keep-alive sender task
-    let stream_clone = Arc::clone(&stream);
+    let stream_write_clone = Arc::clone(&stream.write_stream);
     let keep_alive_clone = Arc::clone(&keep_alive_id);
 
     let keep_alive_handle =
-        tokio::spawn(async move { send_keep_alive(stream_clone, keep_alive_clone).await });
+        tokio::spawn(async move { send_keep_alive(stream_write_clone, keep_alive_clone).await });
 
     // Spawn connection monitor
     let keep_alive_clone = Arc::clone(&keep_alive_id);
@@ -131,9 +152,14 @@ async fn play_state(
 
     let result = async {
         loop {
-            let ready = stream.lock().await.ready(Interest::READABLE).await?;
+            let ready = stream
+                .read_stream
+                .lock()
+                .await
+                .ready(Interest::READABLE)
+                .await?;
             if ready.is_readable() {
-                let (prot, mut buf) = handle_packet(Arc::clone(&stream)).await?;
+                let (prot, mut buf) = handle_packet(Arc::clone(&stream.read_stream)).await?;
                 match prot {
                     0x1A => {
                         println!("Client sent keep alive");
@@ -182,7 +208,7 @@ async fn handle_keep_alive(
     Ok(())
 }
 
-async fn send_keep_alive(stream: Arc<Mutex<TcpStream>>, keep_alive_id: Arc<KeepAliveState>) {
+async fn send_keep_alive(stream: Arc<Mutex<OwnedWriteHalf>>, keep_alive_id: Arc<KeepAliveState>) {
     println!("Starting keep-alive task");
 
     loop {
@@ -202,29 +228,31 @@ async fn send_keep_alive(stream: Arc<Mutex<TcpStream>>, keep_alive_id: Arc<KeepA
     }
 }
 
-async fn handshake_state(stream: Arc<Mutex<TcpStream>>) -> Result<State, Error> {
-    let (_, mut buf) = handle_packet(stream).await?;
+async fn handshake_state(stream: ReadWriteStream) -> Result<State, Error> {
+    let (_, mut buf) = handle_packet(stream.read_stream).await?;
     let handshake_packet = handle_handshake(&mut buf)?;
 
     Ok(handshake_packet.next_state)
 }
 
-async fn login_state(stream: Arc<Mutex<TcpStream>>) -> Result<State, Error> {
-    let (_, mut buf) = handle_packet(Arc::clone(&stream)).await?;
+async fn login_state(stream: ReadWriteStream) -> Result<State, Error> {
+    let (_, mut buf) = handle_packet(Arc::clone(&stream.read_stream)).await?;
     let (name, uuid) = handle_login_client(&mut buf)?;
 
-    send_login_success(stream, name, uuid).await?;
+    send_login_success(stream.write_stream, name, uuid).await?;
     Ok(State::Config)
 }
 
-async fn config_state(stream: Arc<Mutex<TcpStream>>) -> Result<State, Error> {
-    send_packet(Arc::clone(&stream), 3, Bytes::new()).await?;
-    handle_packet(stream).await?; // Wait for config ack
+async fn config_state(stream: ReadWriteStream) -> Result<State, Error> {
+    let write_stream = stream.write_stream;
+    let read_stream = stream.read_stream;
+    send_packet(Arc::clone(&write_stream), 3, Bytes::new()).await?;
+    handle_packet(read_stream).await?; // Wait for config ack
     Ok(State::Play)
 }
 
 async fn send_login_success(
-    stream: Arc<Mutex<TcpStream>>,
+    stream: Arc<Mutex<OwnedWriteHalf>>,
     name: String,
     uuid: Uuid,
 ) -> Result<(), Error> {
@@ -260,7 +288,7 @@ fn write_var_int(value: u32, buf: &mut BytesMut) -> Result<u8, Error> {
 }
 
 async fn send_packet(
-    stream: Arc<Mutex<TcpStream>>,
+    stream: Arc<Mutex<OwnedWriteHalf>>,
     protocol: u32,
     buf: Bytes,
 ) -> Result<(), Error> {
@@ -284,7 +312,7 @@ async fn send_packet(
     Ok(())
 }
 
-async fn handle_packet(stream: Arc<Mutex<TcpStream>>) -> Result<(u32, Bytes), Error> {
+async fn handle_packet(stream: Arc<Mutex<OwnedReadHalf>>) -> Result<(u32, Bytes), Error> {
     println!("About to acquire stream lock reading");
     let mut stream = stream.lock().await;
     println!("Lock acquired reading");
@@ -332,7 +360,7 @@ fn read_var_int(buf: &mut Bytes) -> Result<u32, Error> {
     Ok(value)
 }
 
-async fn read_packet_length(stream: &mut TcpStream) -> Result<u32, Error> {
+async fn read_packet_length(stream: &mut OwnedReadHalf) -> Result<u32, Error> {
     let mut value = 0u32;
     let mut position = 0;
     let mut byte = [0u8; 1];
