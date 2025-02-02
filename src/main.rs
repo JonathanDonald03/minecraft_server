@@ -150,6 +150,14 @@ async fn play_state(
     let keep_alive_clone = Arc::clone(&keep_alive_id);
     let monitor_handle = tokio::spawn(async move { monitor_connection(keep_alive_clone).await });
 
+    let mut buf = BytesMut::new();
+    let _res = handle_play_login(&mut buf);
+    let _ = send_packet(stream.write_stream.clone(), 0x2C, buf.freeze()).await;
+    let mut buf = BytesMut::new();
+    let _player_init_pos_pack = handle_player_position(&mut buf)?;
+    println!("Buffer after function call {}", hex::encode(buf.clone()));
+    let _ = send_packet(stream.write_stream, 0x42, buf.freeze()).await;
+
     let result = async {
         loop {
             let ready = stream
@@ -286,6 +294,105 @@ fn write_var_int(value: u32, buf: &mut BytesMut) -> Result<u8, Error> {
     }
     Ok(size)
 }
+
+//Used for login for now
+//TODO: make work for enderpearl and teleports
+fn handle_player_position(buf: &mut BytesMut) -> Result<(), Error> {
+    let teleport_id = 324;
+    let x_pos: f64 = 0.0;
+    let y_pos: f64 = 64.0;
+    let z_pos: f64 = 0.0;
+    let vel_x: f64 = 0.0;
+    let vel_y: f64 = 0.0;
+    let vel_z: f64 = 0.0;
+    let yaw: f32 = 0.1;
+    let pitch: f32 = 0.1;
+    // let flags: u32 = 0;
+    let _ = write_var_int(teleport_id, buf);
+    buf.put_f64(x_pos);
+    buf.put_f64(y_pos);
+    buf.put_f64(z_pos);
+    buf.put_f64(vel_x);
+    buf.put_f64(vel_y);
+    buf.put_f64(vel_z);
+    buf.put_f32(yaw);
+    buf.put_f32(pitch);
+    //Todo this is flags probably wrong idk
+    buf.put_i32(0x00000000);
+    println!("Buffer {}", hex::encode(buf));
+    Ok(())
+}
+
+//Todo make this work without fixed values
+fn handle_play_login(buf: &mut BytesMut) -> Result<(), Error> {
+    let entity_id: i32 = 1;
+    let is_hardcore = false;
+
+    // Dimension names should be a proper registry array
+    let dimension_names = vec![
+        "minecraft:overworld",
+        "minecraft:the_nether",
+        "minecraft:the_end",
+    ];
+    let len_array_dim_names = dimension_names.len() as u32;
+
+    let max_players = 1;
+    let view_distance = 3;
+    let simulation_distance = 3;
+    let reduced_debug_info = false;
+    let respawn_screen = true;
+    let do_limited_crafting = false;
+
+    // Use proper dimension type identifier
+    let dimension_type = 0;
+    let dimension_name = "minecraft:overworld";
+    let hashed_seed = -2039017012206836916i64;
+    let game_mode: u8 = 1;
+    let previous_game_mode = -1;
+    let is_debug = true;
+    let is_flat = true;
+    let has_death_location = false;
+    let portal_cooldown = 5;
+    let sea_level = 63; // Default Minecraft sea level
+    let enforces_secure_chat = false;
+
+    // Write packet data
+    buf.put_i32(entity_id);
+    buf.put_u8(is_hardcore as u8);
+
+    // Write dimension names array
+    let _ = write_var_int(len_array_dim_names, buf);
+    for dim_name in dimension_names {
+        let _ = write_var_int(dim_name.len() as u32, buf);
+        buf.extend_from_slice(dim_name.as_bytes());
+    }
+
+    let _ = write_var_int(max_players, buf);
+    let _ = write_var_int(view_distance, buf);
+    let _ = write_var_int(simulation_distance, buf);
+    buf.put_u8(reduced_debug_info as u8);
+    buf.put_u8(respawn_screen as u8);
+    buf.put_u8(do_limited_crafting as u8);
+
+    // Write dimension type as identifier string
+    let _ = write_var_int(dimension_type, buf);
+
+    let _ = write_var_int(dimension_name.len() as u32, buf);
+    buf.extend_from_slice(dimension_name.as_bytes());
+
+    buf.put_i64(hashed_seed);
+    buf.put_u8(game_mode);
+    buf.put_i8(previous_game_mode);
+    buf.put_u8(is_debug as u8);
+    buf.put_u8(is_flat as u8);
+    buf.put_u8(has_death_location as u8);
+    let _ = write_var_int(portal_cooldown, buf);
+    let _ = write_var_int(sea_level, buf);
+    buf.put_u8(enforces_secure_chat as u8);
+    Ok(())
+}
+
+// async fn handle_flat_world_chunk(buf: &mut BytesMut) -> Result<(), Error> {}
 
 async fn send_packet(
     stream: Arc<Mutex<OwnedWriteHalf>>,
